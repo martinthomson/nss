@@ -986,6 +986,37 @@ TEST_F(TlsConnectTest, TestTls13ResumptionTwice) {
   ASSERT_EQ(psk1, psk2);
 }
 
+TEST_F(TlsConnectTest, DisablePSKAndFailToResume) {
+  ConfigureSessionCache(RESUME_BOTH, RESUME_TICKET);
+  client_->SetVersionRange(SSL_LIBRARY_VERSION_TLS_1_1,
+                           SSL_LIBRARY_VERSION_TLS_1_3);
+  server_->SetVersionRange(SSL_LIBRARY_VERSION_TLS_1_1,
+                           SSL_LIBRARY_VERSION_TLS_1_3);
+  Connect();
+  SendReceive(); // Need to read so that we absorb the session ticket.
+  CheckKeys(ssl_kea_ecdh, ssl_auth_rsa);
+
+  ResetRsa();
+  ConfigureSessionCache(RESUME_BOTH, RESUME_TICKET);
+  TlsExtensionCapture *c1 =
+      new TlsExtensionCapture(kTlsExtensionPreSharedKey);
+  client_->SetVersionRange(SSL_LIBRARY_VERSION_TLS_1_1,
+                           SSL_LIBRARY_VERSION_TLS_1_3);
+  server_->SetVersionRange(SSL_LIBRARY_VERSION_TLS_1_1,
+                           SSL_LIBRARY_VERSION_TLS_1_3);
+  EXPECT_EQ(SECSuccess,
+            SSL_CipherPrefSet(client_->ssl_fd(),
+                              TLS_ECDHE_PSK_WITH_AES_128_GCM_SHA256,
+                              false));
+  ExpectResumption(RESUME_NONE);
+  Connect();
+  SendReceive();
+  CheckKeys(ssl_kea_ecdh, ssl_auth_rsa);
+  DataBuffer psk1(c1->extension());
+  EXPECT_EQ(psk1.len(), 0UL);
+}
+
+
 TEST_P(TlsConnectDatagram, TestDtlsHolddownExpiry) {
   Connect();
   std::cerr << "Expiring holddown timer\n";
