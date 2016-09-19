@@ -62,14 +62,10 @@ ssl_NamedGroup2ECParams(PLArenaPool *arena, const namedGroupDef *ecGroup,
     PRUint32 policyFlags = 0;
     SECStatus rv;
 
-    if (!params) {
-        PORT_Assert(0);
-        PORT_SetError(SEC_ERROR_INVALID_ARGS);
-        return SECFailure;
-    }
-
-    if (!ecGroup || ecGroup->type != group_type_ec ||
-        (oidData = SECOID_FindOIDByTag(ecGroup->oidTag)) == NULL) {
+    PORT_Assert(params);
+    PORT_Assert(ecGroup);
+    PORT_Assert(ecGroup->type == group_type_ec);
+    if ((oidData = SECOID_FindOIDByTag(ecGroup->oidTag)) == NULL) {
         PORT_SetError(SEC_ERROR_UNSUPPORTED_ELLIPTIC_CURVE);
         return SECFailure;
     }
@@ -554,6 +550,10 @@ ssl_CreateECDHEphemeralKeyPair(const namedGroupDef *ecGroup,
     return SECSuccess;
 }
 
+/* We index gECDHEKeyPairs by the named group.  To make the tables align, use
+ * pointer arithmetic. */
+#define STATIC_ECDH_SHARE(groupDef) gECDHEKeyPairs[groupDef - ssl_named_groups]
+
 /* CallOnce function, called once for each named curve. */
 static PRStatus
 ssl_CreateECDHEphemeralKeyPairOnce(void *arg)
@@ -563,16 +563,16 @@ ssl_CreateECDHEphemeralKeyPairOnce(void *arg)
     SECStatus rv;
 
     PORT_Assert(groupDef->type == group_type_ec);
-    PORT_Assert(gECDHEKeyPairs[groupDef->index].pair == NULL);
+    PORT_Assert(STATIC_ECDH_SHARE(groupDef).pair == NULL);
 
     /* ok, no one has generated a global key for this curve yet, do so */
     rv = ssl_CreateECDHEphemeralKeyPair(groupDef, &keyPair);
     if (rv != SECSuccess) {
-        gECDHEKeyPairs[groupDef->index].error = PORT_GetError();
+        STATIC_ECDH_SHARE(groupDef).error = PORT_GetError();
         return PR_FAILURE;
     }
 
-    gECDHEKeyPairs[groupDef->index].pair = keyPair;
+    STATIC_ECDH_SHARE(groupDef).pair = keyPair;
     return PR_SUCCESS;
 }
 
@@ -591,7 +591,7 @@ ssl_CreateECDHEphemeralKeys(sslSocket *ss, const namedGroupDef *ecGroup)
     sslEphemeralKeyPair *keyPair = NULL;
 
     /* if there's no global key for this curve, make one. */
-    if (gECDHEKeyPairs[ecGroup->index].pair == NULL) {
+    if (STATIC_ECDH_SHARE(ecGroup).pair == NULL) {
         PRStatus status;
 
         status = PR_CallOnce(&gECDHEInitOnce, ssl_ECRegister);
@@ -599,16 +599,16 @@ ssl_CreateECDHEphemeralKeys(sslSocket *ss, const namedGroupDef *ecGroup)
             PORT_SetError(gECDHEInitError);
             return SECFailure;
         }
-        status = PR_CallOnceWithArg(&gECDHEKeyPairs[ecGroup->index].once,
+        status = PR_CallOnceWithArg(&STATIC_ECDH_SHARE(ecGroup).once,
                                     ssl_CreateECDHEphemeralKeyPairOnce,
                                     (void *)ecGroup);
         if (status != PR_SUCCESS) {
-            PORT_SetError(gECDHEKeyPairs[ecGroup->index].error);
+            PORT_SetError(STATIC_ECDH_SHARE(ecGroup).error);
             return SECFailure;
         }
     }
 
-    keyPair = ssl_CopyEphemeralKeyPair(gECDHEKeyPairs[ecGroup->index].pair);
+    keyPair = ssl_CopyEphemeralKeyPair(STATIC_ECDH_SHARE(ecGroup).pair);
     PORT_Assert(keyPair != NULL);
     if (!keyPair)
         return SECFailure;
@@ -1002,31 +1002,6 @@ PRBool
 ssl_IsDHEEnabled(sslSocket *ss)
 {
     return ssl_IsSuiteEnabled(ss, ssl_dhe_suites);
-}
-
-void
-ssl_DisableNonSuiteBGroups(sslSocket *ss)
-{
-    unsigned int i;
-    PK11SlotInfo *slot;
-
-    /* See if we can support small curves (like 163). If not, assume we can
-     * only support Suite-B curves (P-256, P-384, P-521). */
-    slot = PK11_GetBestSlotWithAttributes(CKM_ECDH1_DERIVE, 0, 163,
-                                          ss->pkcs11PinArg);
-    if (slot) {
-        /* Looks like we're committed to having lots of curves. */
-        PK11_FreeSlot(slot);
-        return;
-    }
-
-    for (i = 0; i < SSL_NAMED_GROUP_COUNT; ++i) {
-        if (ss->namedGroupPreferences[i] &&
-            ss->namedGroupPreferences[i]->type == group_type_ec &&
-            !ss->namedGroupPreferences[i]->suiteb) {
-            ss->namedGroupPreferences[i] = NULL;
-        }
-    }
 }
 
 /* Send our Supported Groups extension. */

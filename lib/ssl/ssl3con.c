@@ -6778,8 +6778,7 @@ ssl3_SendDHClientKeyExchange(sslSocket *ss, SECKEYPublicKey *svrPubKey)
     ssl3DHParams customParams;
     const namedGroupDef *groupDef;
     namedGroupDef customGroupDef = {
-        0, ssl_grp_ffdhe_custom, 0, group_type_ff,
-        SEC_OID_TLS_DHE_CUSTOM, PR_FALSE
+        ssl_grp_ffdhe_custom, 0, group_type_ff, SEC_OID_TLS_DHE_CUSTOM
     };
     sslEphemeralKeyPair *keyPair = NULL;
     SECKEYPublicKey *pubKey;
@@ -13592,7 +13591,7 @@ ssl3_InitState(sslSocket *ss)
 
     ss->ssl3.hs.zeroRttState = ssl_0rtt_none;
 
-    ssl_DisableNonSuiteBGroups(ss);
+    ssl_FilterSupportedGroups(ss);
 
     ss->ssl3.initialized = PR_TRUE;
     return SECSuccess;
