@@ -52,6 +52,7 @@ struct HpkeContextStr {
 static const hpkeKemParams kemParams[] = {
     /* KEM, Nsk, Nsecret, Npk, oidTag, Hash mechanism  */
     { HpkeDhKemP256Sha256, 32, 32, 65, SEC_OID_ANSIX962_EC_PRIME256V1, CKM_SHA256 },
+    { HpkeDhKemP384Sha384, 48, 48, 97, SEC_OID_SECG_EC_SECP384R1, CKM_SHA384 },
     { HpkeDhKemX25519Sha256, 32, 32, 32, SEC_OID_CURVE25519, CKM_SHA256 },
 };
 
@@ -76,8 +77,10 @@ kemId2Params(HpkeKemId kemId)
     switch (kemId) {
         case HpkeDhKemP256Sha256:
             return &kemParams[0];
-        case HpkeDhKemX25519Sha256:
+        case HpkeDhKemP384Sha384:
             return &kemParams[1];
+        case HpkeDhKemX25519Sha256:
+            return &kemParams[2];
         default:
             return NULL;
     }

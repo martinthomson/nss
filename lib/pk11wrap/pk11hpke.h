@@ -40,6 +40,7 @@ typedef enum {
 /* https://datatracker.ietf.org/doc/html/rfc9180#section-7.1 */
 typedef enum {
     HpkeDhKemP256Sha256 = 0x10,
+    HpkeDhKemP384Sha384 = 0x11,
     HpkeDhKemX25519Sha256 = 0x20,
 } HpkeKemId;
 

@@ -149,15 +149,27 @@ class HpkeTest {
   bool GenerateKeyPair(ScopedSECKEYPublicKey &pub_key,
                        ScopedSECKEYPrivateKey &priv_key,
                        HpkeKemId kem = HpkeDhKemX25519Sha256) {
+    SECOidTag curve_oid;
+    switch (kem) {
+      case HpkeDhKemP256Sha256:
+        curve_oid = SEC_OID_ANSIX962_EC_PRIME256V1;
+        break;
+      case HpkeDhKemP384Sha384:
+        curve_oid = SEC_OID_SECG_EC_SECP384R1;
+        break;
+      case HpkeDhKemX25519Sha256:
+        curve_oid = SEC_OID_CURVE25519;
+        break;
+      default:
+        return false;
+    }
+
     ScopedPK11SlotInfo slot(PK11_GetInternalSlot());
     if (!slot) {
       ADD_FAILURE() << "Couldn't get slot";
       return false;
     }
 
-    SECOidTag curve_oid = (kem == HpkeDhKemP256Sha256)
-                              ? SEC_OID_ANSIX962_EC_PRIME256V1
-                              : SEC_OID_CURVE25519;
     unsigned char param_buf[65];
     SECItem ecdsa_params = {siBuffer, param_buf, sizeof(param_buf)};
     SECOidData *oid_data = SECOID_FindOIDByTag(curve_oid);
@@ -243,11 +255,13 @@ struct HpkeEncryptVector {
         if (n == "") {
           break;
         }
-        if (n == "plaintext") {
+        /* "plaintext"/"ciphertext" in the preprocessed form,
+         * "pt"/"ct" in the official form. */
+        if (n == "plaintext" || n == "pt") {
           enc.pt = r.ReadHex();
         } else if (n == "aad") {
           enc.aad = r.ReadHex();
-        } else if (n == "ciphertext") {
+        } else if (n == "ciphertext" || n == "ct") {
           enc.ct = r.ReadHex();
         } else {
           r.SkipValue();
@@ -308,14 +322,29 @@ struct HpkeVector {
   std::vector<uint8_t> nonce;
   std::vector<HpkeEncryptVector> encryptions;
   std::vector<HpkeExportVector> exports;
+  /* Some vector sets (the official form) only provide the ephemeral key as
+   * ikmE, not as skEm/pkEm, so the sender flow can't be reproduced
+   * deterministically. Those are validated via the receiver (decap) flow. */
+  bool has_sender_keys;
 
   static std::vector<uint8_t> Pkcs8(HpkeKemId kem,
                                     const std::vector<uint8_t> &sk,
                                     const std::vector<uint8_t> &pk) {
-    if (kem == HpkeDhKemP256Sha256) {
-      return Pkcs8P256(sk, pk);
+    switch (kem) {
+      case HpkeDhKemP256Sha256:
+        return Pkcs8P256(sk, pk);
+      case HpkeDhKemP384Sha384:
+        return Pkcs8P384(sk, pk);
+      case HpkeDhKemX25519Sha256:
+        return X25519Key(sk, pk);
+      default:
+        ADD_FAILURE() << "Unknown KEM: " << kem;
+        return std::vector<uint8_t>();
     }
-    // X25519 format.
+  }
+
+  static std::vector<uint8_t> X25519Key(const std::vector<uint8_t> &sk,
+                                        const std::vector<uint8_t> &pk) {
     std::vector<uint8_t> v(105);
     v.assign({0x30, 0x67, 0x02, 0x01, 0x00, 0x30, 0x14, 0x06, 0x07,
               0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x09,
@@ -356,6 +385,35 @@ struct HpkeVector {
     return v;
   }
 
+  // PrivateKeyInfo (PKCS#8) wrapping an RFC 5915 ECPrivateKey for P-384.
+  // sk is the 48-byte scalar, pk the 97-byte uncompressed point.
+  static std::vector<uint8_t> Pkcs8P384(const std::vector<uint8_t> &sk,
+                                        const std::vector<uint8_t> &pk) {
+    EXPECT_EQ(48U, sk.size());
+    EXPECT_EQ(97U, pk.size());
+    std::vector<uint8_t> v;
+    // PrivateKeyInfo SEQUENCE (182 bytes of content).
+    v.assign({0x30, 0x81, 0xb6,
+              // version INTEGER 0
+              0x02, 0x01, 0x00,
+              // privateKeyAlgorithm: ecPublicKey + secp384r1
+              0x30, 0x10, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+              0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22,
+              // privateKey OCTET STRING wrapping the ECPrivateKey (158 bytes)
+              0x04, 0x81, 0x9e,
+              // ECPrivateKey SEQUENCE (155 bytes of content)
+              0x30, 0x81, 0x9b,
+              // version INTEGER 1
+              0x02, 0x01, 0x01,
+              // privateKey OCTET STRING (48 bytes)
+              0x04, 0x30});
+    v.insert(v.end(), sk.begin(), sk.end());
+    // publicKey [1] EXPLICIT BIT STRING (97-byte point, 0 unused bits)
+    v.insert(v.end(), {0xa1, 0x64, 0x03, 0x62, 0x00});
+    v.insert(v.end(), pk.begin(), pk.end());
+    return v;
+  }
+
   static std::vector<HpkeVector> Read(JsonReader &r) {
     std::vector<HpkeVector> all_tests;
     uint32_t test_id = 0;
@@ -363,17 +421,10 @@ struct HpkeVector {
     while (r.NextItemArray()) {
       HpkeVector vec = {0};
       uint32_t fields = 0;
-      enum class RequiredFields {
-        mode,
-        kem,
-        kdf,
-        aead,
-        skEm,
-        skRm,
-        pkEm,
-        pkRm,
-        all
-      };
+      /* skEm/pkEm are intentionally not required: the official vector form
+       * only provides the ephemeral key as ikmE. Vectors that omit them are
+       * exercised through the receiver (decap) flow instead. */
+      enum class RequiredFields { mode, kem, kdf, aead, skRm, pkRm, all };
       std::vector<uint8_t> sk_e, pk_e, sk_r, pk_r;
       test_id++;
 
@@ -398,10 +449,8 @@ struct HpkeVector {
           vec.info = r.ReadHex();
         } else if (n == "skEm") {
           sk_e = r.ReadHex();
-          fields |= 1 << static_cast<uint32_t>(RequiredFields::skEm);
         } else if (n == "pkEm") {
           pk_e = r.ReadHex();
-          fields |= 1 << static_cast<uint32_t>(RequiredFields::pkEm);
         } else if (n == "skRm") {
           sk_r = r.ReadHex();
           fields |= 1 << static_cast<uint32_t>(RequiredFields::skRm);
@@ -443,7 +492,10 @@ struct HpkeVector {
       }
 
       vec.test_id = test_id;
-      vec.pkcs8_e = HpkeVector::Pkcs8(vec.kem_id, sk_e, pk_e);
+      vec.has_sender_keys = !sk_e.empty() && !pk_e.empty();
+      if (vec.has_sender_keys) {
+        vec.pkcs8_e = HpkeVector::Pkcs8(vec.kem_id, sk_e, pk_e);
+      }
       vec.pkcs8_r = HpkeVector::Pkcs8(vec.kem_id, sk_r, pk_r);
       all_tests.push_back(vec);
     }
@@ -537,6 +589,30 @@ class TestVectors : public HpkeTest, public ::testing::Test {
     }
   }
 
+  /* When only receiver key material is available, validate the known-answer
+   * ciphertexts by decrypting them. Encryptions are consecutive from
+   * sequence 0, matching the receiver's per-Open nonce increment. */
+  void TestDecryptions(const HpkeVector &vec, const Endpoint &receiver) {
+    for (auto &enc : vec.encryptions) {
+      std::vector<uint8_t> opened;
+      Open(receiver.cx_, enc.aad, enc.ct, &opened);
+      EXPECT_EQ(enc.pt, opened);
+    }
+  }
+
+  void TestExportsReceiver(const HpkeVector &vec, const Endpoint &receiver) {
+    for (auto &exp : vec.exports) {
+      SECItem context_item = {siBuffer, toUcharPtr(exp.ctxt.data()),
+                              static_cast<unsigned int>(exp.ctxt.size())};
+      PK11SymKey *actual_r = nullptr;
+      ASSERT_EQ(SECSuccess,
+                PK11_HPKE_ExportSecret(receiver.cx_.get(), &context_item,
+                                       exp.len, &actual_r));
+      ScopedPK11SymKey scoped_act_r(actual_r);
+      CheckEquality(exp.exported, scoped_act_r.get());
+    }
+  }
+
   void SetupS(const ScopedHpkeContext &cx, const ScopedSECKEYPublicKey &pkE,
               const ScopedSECKEYPrivateKey &skE,
               const ScopedSECKEYPublicKey &pkR,
@@ -562,7 +638,7 @@ class TestVectors : public HpkeTest, public ::testing::Test {
   void SetupSenderReceiver(const HpkeVector &vec, const Endpoint &sender,
                            const Endpoint &receiver) {
     SetupS(sender.cx_, sender.pk_, sender.sk_, receiver.pk_, vec.info);
-    uint8_t buf[65];  // Large enough for X25519 (32) or P-256 (65).
+    uint8_t buf[133];  // Large enough for any supported KEM (P-521 == 133).
     SECItem encap_item = {siBuffer, const_cast<uint8_t *>(buf), sizeof(buf)};
     ASSERT_EQ(SECSuccess, PK11_HPKE_Serialize(sender.pk_.get(), encap_item.data,
                                               &encap_item.len, encap_item.len));
@@ -571,23 +647,34 @@ class TestVectors : public HpkeTest, public ::testing::Test {
   }
 
   void RunTestVector(const HpkeVector &vec) {
-    Endpoint sender;
-    ASSERT_TRUE(sender.init(vec, vec.pkcs8_e));
     Endpoint receiver;
     ASSERT_TRUE(receiver.init(vec, vec.pkcs8_r));
 
-    SetupSenderReceiver(vec, sender, receiver);
-    TestEncryptions(vec, sender, receiver);
-    TestExports(vec, sender, receiver);
+    if (vec.has_sender_keys) {
+      /* Full sender + receiver flow, including deterministic enc. */
+      Endpoint sender;
+      ASSERT_TRUE(sender.init(vec, vec.pkcs8_e));
+      SetupSenderReceiver(vec, sender, receiver);
+      TestEncryptions(vec, sender, receiver);
+      TestExports(vec, sender, receiver);
+    } else {
+      /* Receiver-only flow: decapsulate the provided enc and validate the
+       * known-answer ciphertexts and exports. */
+      SetupR(receiver.cx_, receiver.pk_, receiver.sk_, vec.enc, vec.info);
+      TestDecryptions(vec, receiver);
+      TestExportsReceiver(vec, receiver);
+    }
   }
 };
 
 TEST_F(TestVectors, HpkeVectors) {
-  JsonReader r(::g_source_dir + "/hpke-vectors.json");
-  auto all_tests = HpkeVector::Read(r);
-  for (auto &vec : all_tests) {
-    std::cout << "HPKE vector " << vec.test_id << std::endl;
-    RunTestVector(vec);
+  for (const char *file : {"/hpke-vectors.json", "/hpke-vectors-decap.json"}) {
+    JsonReader r(::g_source_dir + file);
+    auto all_tests = HpkeVector::Read(r);
+    for (auto &vec : all_tests) {
+      std::cout << "HPKE vector " << file << " " << vec.test_id << std::endl;
+      RunTestVector(vec);
+    }
   }
 }
 
@@ -597,8 +684,8 @@ class ModeParameterizedTest
           std::tuple<HpkeModeId, HpkeKemId, HpkeKdfId, HpkeAeadId>> {};
 
 static const HpkeModeId kHpkeModesAll[] = {HpkeModeBase, HpkeModePsk};
-static const HpkeKemId kHpkeKemIdsAll[] = {HpkeDhKemX25519Sha256,
-                                           HpkeDhKemP256Sha256};
+static const HpkeKemId kHpkeKemIdsAll[] = {
+    HpkeDhKemX25519Sha256, HpkeDhKemP256Sha256, HpkeDhKemP384Sha384};
 static const HpkeKdfId kHpkeKdfIdsAll[] = {HpkeKdfHkdfSha256, HpkeKdfHkdfSha384,
                                            HpkeKdfHkdfSha512};
 static const HpkeAeadId kHpkeAeadIdsAll[] = {HpkeAeadAes128Gcm,
