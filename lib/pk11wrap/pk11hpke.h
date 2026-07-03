@@ -37,8 +37,9 @@ typedef enum {
     HpkeModePsk = 1,
 } HpkeModeId;
 
-/* https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-hpke-08#section-7.1 */
+/* https://datatracker.ietf.org/doc/html/rfc9180#section-7.1 */
 typedef enum {
+    HpkeDhKemP256Sha256 = 0x10,
     HpkeDhKemX25519Sha256 = 0x20,
 } HpkeKemId;
 

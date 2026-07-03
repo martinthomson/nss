@@ -147,16 +147,20 @@ class HpkeTest {
   }
 
   bool GenerateKeyPair(ScopedSECKEYPublicKey &pub_key,
-                       ScopedSECKEYPrivateKey &priv_key) {
+                       ScopedSECKEYPrivateKey &priv_key,
+                       HpkeKemId kem = HpkeDhKemX25519Sha256) {
     ScopedPK11SlotInfo slot(PK11_GetInternalSlot());
     if (!slot) {
       ADD_FAILURE() << "Couldn't get slot";
       return false;
     }
 
+    SECOidTag curve_oid = (kem == HpkeDhKemP256Sha256)
+                              ? SEC_OID_ANSIX962_EC_PRIME256V1
+                              : SEC_OID_CURVE25519;
     unsigned char param_buf[65];
     SECItem ecdsa_params = {siBuffer, param_buf, sizeof(param_buf)};
-    SECOidData *oid_data = SECOID_FindOIDByTag(SEC_OID_CURVE25519);
+    SECOidData *oid_data = SECOID_FindOIDByTag(curve_oid);
     if (!oid_data) {
       ADD_FAILURE() << "Couldn't get oid_data";
       return false;
@@ -212,7 +216,7 @@ class HpkeTest {
 
     ScopedSECKEYPublicKey pub_key_r;
     ScopedSECKEYPrivateKey priv_key_r;
-    ASSERT_TRUE(GenerateKeyPair(pub_key_r, priv_key_r));
+    ASSERT_TRUE(GenerateKeyPair(pub_key_r, priv_key_r, kem));
     EXPECT_EQ(SECSuccess, PK11_HPKE_SetupS(sender.get(), nullptr, nullptr,
                                            pub_key_r.get(), &info_item));
 
@@ -305,9 +309,13 @@ struct HpkeVector {
   std::vector<HpkeEncryptVector> encryptions;
   std::vector<HpkeExportVector> exports;
 
-  static std::vector<uint8_t> Pkcs8(const std::vector<uint8_t> &sk,
+  static std::vector<uint8_t> Pkcs8(HpkeKemId kem,
+                                    const std::vector<uint8_t> &sk,
                                     const std::vector<uint8_t> &pk) {
-    // Only X25519 format.
+    if (kem == HpkeDhKemP256Sha256) {
+      return Pkcs8P256(sk, pk);
+    }
+    // X25519 format.
     std::vector<uint8_t> v(105);
     v.assign({0x30, 0x67, 0x02, 0x01, 0x00, 0x30, 0x14, 0x06, 0x07,
               0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x09,
@@ -315,6 +323,35 @@ struct HpkeVector {
               0x04, 0x4c, 0x30, 0x4a, 0x02, 0x01, 0x01, 0x04, 0x20});
     v.insert(v.end(), sk.begin(), sk.end());
     v.insert(v.end(), {0xa1, 0x23, 0x03, 0x21, 0x00});
+    v.insert(v.end(), pk.begin(), pk.end());
+    return v;
+  }
+
+  // PrivateKeyInfo (PKCS#8) wrapping an RFC 5915 ECPrivateKey for P-256.
+  // sk is the 32-byte scalar, pk the 65-byte uncompressed point.
+  static std::vector<uint8_t> Pkcs8P256(const std::vector<uint8_t> &sk,
+                                        const std::vector<uint8_t> &pk) {
+    EXPECT_EQ(32U, sk.size());
+    EXPECT_EQ(65U, pk.size());
+    std::vector<uint8_t> v;
+    // PrivateKeyInfo SEQUENCE (135 bytes of content).
+    v.assign({0x30, 0x81, 0x87,
+              // version INTEGER 0
+              0x02, 0x01, 0x00,
+              // privateKeyAlgorithm: ecPublicKey + prime256v1
+              0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
+              0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
+              // privateKey OCTET STRING wrapping the ECPrivateKey (109 bytes)
+              0x04, 0x6d,
+              // ECPrivateKey SEQUENCE (107 bytes of content)
+              0x30, 0x6b,
+              // version INTEGER 1
+              0x02, 0x01, 0x01,
+              // privateKey OCTET STRING (32 bytes)
+              0x04, 0x20});
+    v.insert(v.end(), sk.begin(), sk.end());
+    // publicKey [1] EXPLICIT BIT STRING (65-byte point, 0 unused bits)
+    v.insert(v.end(), {0xa1, 0x44, 0x03, 0x42, 0x00});
     v.insert(v.end(), pk.begin(), pk.end());
     return v;
   }
@@ -406,8 +443,8 @@ struct HpkeVector {
       }
 
       vec.test_id = test_id;
-      vec.pkcs8_e = HpkeVector::Pkcs8(sk_e, pk_e);
-      vec.pkcs8_r = HpkeVector::Pkcs8(sk_r, pk_r);
+      vec.pkcs8_e = HpkeVector::Pkcs8(vec.kem_id, sk_e, pk_e);
+      vec.pkcs8_r = HpkeVector::Pkcs8(vec.kem_id, sk_r, pk_r);
       all_tests.push_back(vec);
     }
 
@@ -525,7 +562,7 @@ class TestVectors : public HpkeTest, public ::testing::Test {
   void SetupSenderReceiver(const HpkeVector &vec, const Endpoint &sender,
                            const Endpoint &receiver) {
     SetupS(sender.cx_, sender.pk_, sender.sk_, receiver.pk_, vec.info);
-    uint8_t buf[32];  // Curve25519 only, fixed size.
+    uint8_t buf[65];  // Large enough for X25519 (32) or P-256 (65).
     SECItem encap_item = {siBuffer, const_cast<uint8_t *>(buf), sizeof(buf)};
     ASSERT_EQ(SECSuccess, PK11_HPKE_Serialize(sender.pk_.get(), encap_item.data,
                                               &encap_item.len, encap_item.len));
@@ -560,7 +597,8 @@ class ModeParameterizedTest
           std::tuple<HpkeModeId, HpkeKemId, HpkeKdfId, HpkeAeadId>> {};
 
 static const HpkeModeId kHpkeModesAll[] = {HpkeModeBase, HpkeModePsk};
-static const HpkeKemId kHpkeKemIdsAll[] = {HpkeDhKemX25519Sha256};
+static const HpkeKemId kHpkeKemIdsAll[] = {HpkeDhKemX25519Sha256,
+                                           HpkeDhKemP256Sha256};
 static const HpkeKdfId kHpkeKdfIdsAll[] = {HpkeKdfHkdfSha256, HpkeKdfHkdfSha384,
                                            HpkeKdfHkdfSha512};
 static const HpkeAeadId kHpkeAeadIdsAll[] = {HpkeAeadAes128Gcm,
